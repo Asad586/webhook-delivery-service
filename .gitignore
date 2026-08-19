@@ -65,3 +65,5 @@ src/generated/
 skills-lock.json
 
 payload.json
+
+.env.test
