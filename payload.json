@@ -1,1 +1,1 @@
-{"id":"evt_200","type":"payment.succeeded","data":{"amount":70}}
+{"id":"evt_dead_1","type":"payment.failed","data":{"reason":"card_declined"}}
