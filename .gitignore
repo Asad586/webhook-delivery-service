@@ -63,3 +63,5 @@ src/generated/
 .windsurf/
 .agents/
 skills-lock.json
+
+payload.json
