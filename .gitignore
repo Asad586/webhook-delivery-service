@@ -56,3 +56,10 @@ pids
 report.[0-9]*.[0-9]*.[0-9]*.[0-9]*.json
 
 /generated/prisma
+
+
+generated/
+.claude/
+.windsurf/
+.agents/
+skills-lock.json
