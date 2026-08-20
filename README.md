@@ -1,10 +1,5 @@
 # Webhook Delivery Service
 
-> **How to use this file:** everything in `[WRITE: ...]` is a prompt for you, not
-> content. Replace each one with your own prose and delete the marker. The tables,
-> numbers, and query plans are already filled in from your actual runs — don't
-> change those. Delete this block when you're done.
-
 A service that ingests webhooks from a provider exactly once and delivers them
 onward to registered subscribers with retries, exponential backoff, and a
 dead-letter queue.
@@ -15,10 +10,15 @@ NestJS · PostgreSQL 16 · Prisma 7 · Docker Compose · Jest · GitHub Actions
 
 ## The problem
 
-[WRITE: Three or four sentences. Providers deliver at-least-once, so duplicates
-are normal, not exceptional. Networks fail mid-response. Subscribers go down for
-hours and come back all at once. State what sits in the middle and what it has to
-guarantee. Don't sell — describe.]
+Webhook providers deliver at-least-once. A duplicate is not an error condition,
+it is the normal case — the provider cannot know whether its last request reached
+you, so it sends it again. Networks fail after the request is processed but
+before the response is read. Subscribers go down for hours and then come back all
+at once, expecting everything that queued up in the meantime.
+
+This service sits between the two. It has to accept duplicates without
+reprocessing them, hold events durably while a subscriber is unavailable, and
+retry in a way that does not make a recovering subscriber's problem worse.
 
 ---
 
@@ -33,9 +33,8 @@ constraint on `(source, provider_event_id)` and a single-statement
 exhausts its attempt budget. Subscribers may receive the same event more than
 once and must deduplicate on `X-Webhook-Event-Id`.
 
-**Bounded retry.** Six attempts with full-jitter exponential backoff from 1s to a
-1h cap, after which the delivery moves to `dead_letters` and leaves the queue
-permanently.
+**Bounded retry.** Six attempts with full-jitter exponential backoff, after which
+the delivery moves to `dead_letters` and leaves the queue permanently.
 
 **Authenticated ingestion.** HMAC-SHA256 over the raw request bytes with a
 timestamp inside the signed payload, compared in constant time.
@@ -46,27 +45,49 @@ timestamp inside the signed payload, compared in constant time.
 
 ### Ordering
 
-[WRITE: Say plainly that ordering is not preserved, then explain why in terms of
-the design — concurrent workers claim disjoint batches, each delivery carries
-independent retry state, so a delivery that fails once will land after one that
-never failed. Then the important half: what guaranteeing order would cost.
-Per-subscriber serialisation means one slow subscriber blocks every event behind
-it. Say why you'd rather have the current behaviour.]
+Events are not delivered in the order they were received.
+
+Workers claim disjoint batches concurrently, and each delivery carries its own
+retry state. An event whose first attempt fails is rescheduled and lands after
+events that were received later and succeeded immediately. Even without failures,
+two workers processing two events give no ordering between them.
+
+Guaranteeing order would mean serialising deliveries per subscriber: one in
+flight at a time, and no event proceeds until the one before it succeeds. That
+turns a single slow or failing subscriber into a head-of-line block for every
+event behind it — an outage on one endpoint becomes a growing backlog rather than
+a set of independent retries. I would rather have out-of-order delivery that
+drains, and let subscribers order by event timestamp if they need to.
 
 ### Exactly-once delivery
 
-[WRITE: This is impossible over HTTP to a third party and you should say so
-directly. Describe the specific case: subscriber returns 200, connection dies
-before the response is read, you retry, they get it twice. There is no protocol
-fix. Then say what you did instead — X-Webhook-Event-Id, so deduplication is
-possible on their side — and be explicit that this moves the problem rather than
-solving it.]
+This is not achievable over HTTP to a third party.
+
+The subscriber returns 200, and the connection drops before the response reaches
+this service. From here, a successful delivery and a lost one look identical, so
+the delivery is retried and the subscriber receives the event twice. No protocol
+change fixes this; the acknowledgement itself can always be the thing that gets
+lost.
+
+Every request therefore carries `X-Webhook-Event-Id`, a stable identifier that is
+the same across all attempts for the same event. That does not make delivery
+exactly-once — it moves the deduplication to the subscriber, who is the only
+party that can actually observe whether they have already processed it.
 
 ### Delivery within a bounded time
 
-[WRITE: Backoff is exponential to a 1h cap, so a subscriber down for a day gets
-deliveries spread across the retry window and then dead-lettered. State the actual
-worst case from your config.]
+Retries are scheduled with full jitter against an exponential ceiling, so the
+delay between attempts is random rather than fixed. With the current
+configuration — base 1s, six attempts — the ceilings across the five retries are
+1s, 2s, 4s, 8s and 16s, giving a worst case of roughly 31 seconds before an event
+dead-letters, and an expected time of about half that.
+
+Worth noting honestly: the 1h cap in the configuration is never reached at these
+settings, because six attempts from a 1s base never climb that high. The cap only
+becomes meaningful with a larger base or a higher attempt budget. A subscriber
+down for an hour currently loses everything sent during that hour to the
+dead-letter queue, which is the correct behaviour only if dead letters are
+actually monitored and replayed.
 
 ---
 
@@ -117,9 +138,14 @@ if (existing) return { status: 'duplicate' };
 const event = await this.prisma.event.create({ ... });
 ```
 
-[WRITE: Explain the race window in your own words — between the SELECT and the
-INSERT another request can commit the same event, so the SELECT proves nothing
-about the state at INSERT time. Note that this passes every single-threaded test.]
+The `SELECT` describes the state of the database at the moment it ran, not at the
+moment the `INSERT` runs. Between those two statements another request can insert
+the same event and commit. Both requests then believe they are the first, and
+both attempt the insert.
+
+Nothing about this is visible in a single-threaded test. Send the same event
+twice in sequence and it behaves correctly every time, because the first insert
+has already committed before the second request starts.
 
 ### Measured failure
 
@@ -137,10 +163,13 @@ and correctly returned `duplicate`. The window is real but narrow — which is
 exactly why this survives code review and single-threaded tests, and only appears
 in production under load.
 
-[WRITE: One paragraph on why the 500s matter more than they look. The unique
-constraint protected the data — no duplicate events were stored. The damage is at
-the API boundary: the provider sees failures for an event that was ingested, and
-retries, reopening the window. Say what that does to the error rate.]
+The data was never at risk. The unique constraint did its job and no duplicate
+event was stored. The damage is entirely at the API boundary: the provider is
+told that eight requests failed for an event that was in fact ingested
+successfully. It will retry those, and those retries can race in the same way.
+The error rate is then a function of how much concurrency the provider applies,
+and it does not settle — a busier provider produces more errors, which produce
+more retries, which produce more concurrency.
 
 Full writeup: [`docs/naive-failure.md`](docs/naive-failure.md)
 
@@ -153,18 +182,29 @@ ON CONFLICT (source, provider_event_id) DO NOTHING
 RETURNING id
 ```
 
-[WRITE: Why the empty result set is the duplicate signal, why this is one round
-trip, and why letting the database arbitrate beats coordinating in application
-code.]
+There is no separate check. The insert either produces a row or it does not, and
+an empty result set is itself the duplicate signal — one statement, one round
+trip, no window between reading and writing.
+
+This also avoids using an exception as control flow. Catching `P2002` would work,
+but it treats an expected, routine outcome as an error, and it means the
+duplicate path is only correct as long as no other unique constraint on the table
+can throw the same code.
+
+The wider point is that the database is the only component that can arbitrate
+here. Two application processes cannot agree on who inserted first without asking
+the database anyway, so the check belongs in the same statement as the write.
 
 ### The subtler bug: fan-out must be in the same transaction
 
-[WRITE: This is the most important paragraph in the README. Walk the failure:
-insert the event, commit, then create deliveries, then crash. The retry sees a
-duplicate, returns 200, and that event is durably stored and permanently
-undelivered. Silent loss that only appears under crash conditions. Say what
-`$transaction` buys and what it costs — the transaction now scales with subscriber
-count, and name the point at which you'd move fan-out to an outbox worker instead.]
+If the event insert and the delivery inserts commit separately, a crash between
+them leaves the event stored with nothing to deliver. The provider retries, the
+handler sees the event already exists and returns 200, so the provider stops.
+Nothing errors and nothing alerts — the worker only reads `deliveries`, and there
+is no row there to read. Running both writes in one transaction makes the pair
+atomic, at the cost of holding a transaction open across the subscriber query and
+the delivery inserts. That's fine at hundreds of subscribers; past that I'd
+insert the event alone and let a separate fan-out worker create the deliveries.
 
 ---
 
@@ -190,19 +230,32 @@ Verified by `test/claim.e2e-spec.ts`: five concurrent workers claiming batches o
 
 Three design decisions:
 
-**The claim transaction commits before any HTTP call.** [WRITE: Why holding a row
-lock across a request to a third party defeats the purpose — a subscriber taking
-30s would hold a Postgres transaction open for 30s. `IN_FLIGHT` + `locked_at` is a
-lease held in committed data, not a lock held in a transaction.]
+**The claim transaction commits before any HTTP call.** A row lock is only held
+for as long as its transaction, so holding one across a request to a third party
+means a subscriber that takes 30 seconds to respond holds a Postgres transaction
+open for 30 seconds. At that point `SKIP LOCKED` stops helping — it avoids
+blocking on locked rows, but the locks themselves are now long-lived, and the
+open transaction holds back vacuum for the whole table. Instead the claim commits
+immediately, and `IN_FLIGHT` plus `locked_at` acts as a lease recorded in
+committed data. The database is not waiting on anything while the delivery is in
+flight.
 
-**`attempts` increments at claim time, not on failure.** [WRITE: What a SIGKILL
-mid-flight would otherwise do — the attempt wouldn't count, and a crash loop
-retries forever without ever dead-lettering.]
+**`attempts` increments at claim time, not on failure.** If the counter only
+advanced on a recorded failure, a worker killed mid-delivery would never record
+one. The row would return to the queue with the same attempt count, be claimed
+again, and be killed again — a crash loop that retries forever and never reaches
+the dead-letter threshold. Counting the attempt when it is claimed means the
+budget is spent whether or not the worker survives to report the outcome.
 
-**A reaper requeues expired leases.** [WRITE: Leases need something to reclaim
-them when a worker dies. State your lease window and why it must exceed the HTTP
-timeout with margin — too short and the reaper requeues live work, deliberately
-double-delivering.]
+**A reaper requeues expired leases.** A lease is only useful if something reclaims
+it when the holder dies. Rows left `IN_FLIGHT` beyond `WORKER_LEASE_SECONDS`
+(300s) are reset to `PENDING` on a timer. That window has to be comfortably longer
+than the HTTP timeout (10s) — if the reaper can fire while a request is still
+legitimately in flight, it requeues live work and a second worker sends the same
+delivery, which is a duplicate this service caused rather than one it inherited.
+The cost of the margin is that genuinely abandoned work waits up to five minutes
+before recovery, so the number is a trade between duplicate deliveries and
+recovery latency rather than a value with a correct answer.
 
 ---
 
@@ -221,11 +274,26 @@ const exponential = Math.min(capMs, baseMs * 2 ** (attempts - 1));
 return Math.floor(random() * exponential); // full jitter
 ```
 
-[WRITE: Why full jitter rather than `exponential + small random`. The thundering
-herd case: a subscriber recovers from an outage and every queued delivery fires in
-the same millisecond, knocking it over again. Then note that Stripe retries all
-non-2xx while you distinguish permanent from transient, and say which you think is
-right and why.]
+The delay is a random value between zero and the exponential ceiling, not the
+ceiling plus a small random offset. The difference matters when a subscriber
+comes back after an outage: every delivery that queued up during the outage has
+been backing off on the same schedule, so with a fixed delay they all become due
+within a few milliseconds of each other and arrive as a single burst. The service
+would then knock over the endpoint it just watched recover. Full jitter spreads
+those deliveries evenly across the whole window instead, and the spread widens
+with each attempt.
+
+On classification, Stripe retries every non-2xx response. This service treats
+most 4xx as permanent and dead-letters immediately. The argument for retrying
+everything is that a 4xx can be transient — a subscriber misconfigured for a few
+minutes returns 404 and then recovers. The argument for distinguishing is that
+retrying a 400 six times over half a minute cannot succeed, because the payload
+being rejected is identical on every attempt, and all it does is spend worker
+capacity and delay the dead-letter signal that tells an operator something is
+wrong. I chose to distinguish, and the cost of being wrong is bounded: a
+mistakenly dead-lettered delivery is still stored and replayable, whereas a
+subscriber drowning in pointless retries is not something the service can undo
+for them.
 
 ---
 
@@ -281,14 +349,22 @@ Execution Time: 0.241 ms
 
 ### Conclusion
 
-[WRITE: Be honest here, it's the section that earns the most credit. The index is
-worth 164×. The choice _between_ the two indexes is worth nothing on read latency —
-0.217 vs 0.241 ms is noise, and the partial is marginally slower. The win is size:
-64 kB vs 5,104 kB, 80×, because the index holds only the ~1% of rows actually
-queued. Rows leave it automatically on transition to SUCCEEDED or FAILED, so it
-stays flat as delivery volume grows while the compound index tracks total table
-size forever. Say you chose it for write cost and cache residency, not read
-latency.]
+Having an index is worth 164× — 35.5ms down to 0.2ms, and 7,246 buffers down to
+around 150. That is the real result, and it is entirely about not reading 500,000
+rows to find 50.
+
+Choosing between the two indexes is worth nothing on read latency. 0.217ms against
+0.241ms is measurement noise, and if anything the partial index is marginally
+slower. Any claim of a speedup here would be invented.
+
+The reason I kept the partial index is size: 64 kB against 5,104 kB, roughly 80×.
+The partial index contains only the rows that are actually queued — about 1% of
+the table — and rows leave it automatically when they transition to `SUCCEEDED` or
+`FAILED`. It therefore stays roughly the size of the outstanding queue no matter
+how many deliveries the service has completed, whereas the compound index has one
+entry per row ever inserted and grows without bound. The benefit is in write cost
+on a high-churn table and in staying resident in cache, not in the latency of the
+query I measured.
 
 Two honest caveats:
 
@@ -316,7 +392,12 @@ Prisma cannot express partial indexes; the index is created by hand in
 | Subscriber returns 4xx                   | Classified permanent                           | Dead-lettered immediately                 |
 | Duplicate provider delivery              | `ON CONFLICT DO NOTHING`                       | 200, no reprocessing                      |
 | Replayed request with captured signature | Rejected outside ±300s window                  | n/a                                       |
-| Clock skew beyond 300s                   | Valid requests rejected                        | [WRITE: what you'd do]                    |
+| Clock skew beyond 300s                   | Valid requests rejected                        | Widen window, or use NTP on both ends     |
+
+The clock skew row is a genuine weakness. The ±300s tolerance protects against
+replay, but it means a server whose clock has drifted rejects legitimate traffic
+and the failure looks like a signature mismatch rather than a time problem. The
+error message distinguishes the two cases for exactly this reason.
 
 Observed in testing — three distinct failure signatures across one dead-lettered
 event: `503` (subscriber rejecting), `500` (subscriber erroring), and `NULL`
@@ -374,38 +455,69 @@ container credentials, and CI needs it.
 
 ## Tradeoffs, and what would change at scale
 
-[WRITE: This section is read first by senior engineers. Cover at minimum:]
+**Postgres as a queue.** For this workload it is the right call. There is one
+datastore instead of two, so there is no window in which an event is committed to
+the database but not yet published to a broker — the fan-out is transactional for
+free, which is the guarantee the whole design rests on. `SKIP LOCKED` handles
+worker contention properly, as the concurrency test shows.
 
-**Postgres as a queue.** [WRITE: Why it's the right call here — one fewer moving
-part, transactional fan-out is free, `SKIP LOCKED` genuinely solves the contention
-problem. Then the honest half: name the specific point at which you'd move to a
-real broker, and what signal would tell you you'd reached it.]
+Where it stops being right is throughput on the claim query. Every worker polls
+the same index and every claim is an `UPDATE`, so contention and write
+amplification both scale with worker count. The signal to move would be claim
+latency rising under load while the queue depth is not falling — that is the point
+where workers are competing rather than working, and adding more makes it worse. A
+broker with real consumer groups would be the answer then, at the cost of having
+to reintroduce the outbox pattern to keep fan-out atomic.
 
-**Fan-out inside the ingest transaction.** [WRITE: Fine at hundreds of subscribers.
-What breaks first, and what the outbox alternative would look like.]
+**Fan-out inside the ingest transaction.** The transaction stays open for the
+subscriber query and one insert per matching subscriber, so its duration scales
+with subscriber count on the hottest write path in the service. What breaks first
+is receive latency, and it degrades gradually rather than failing outright. The
+alternative is to insert only the event and have a separate worker create the
+delivery rows by scanning for events without them — the event row becomes the
+outbox record. That keeps the atomicity guarantee while making the request path
+constant-time, and it is the change I would make first if subscriber counts grew.
 
-**Polling rather than `LISTEN`/`NOTIFY`.** [WRITE: 1s poll latency is well inside
-requirements. Say you considered NOTIFY and why you didn't build it — naming an
-optimisation you declined reads better than building it.]
+**Polling rather than `LISTEN`/`NOTIFY`.** Polling every second means up to a
+second of added latency on a delivery that could have started immediately.
+`LISTEN`/`NOTIFY` would remove most of that, at the cost of a second code path
+that still needs the poll loop as a fallback, since notifications are not
+delivered to a worker that is not connected at the time. A second of latency on
+webhook delivery is not a problem worth that complexity, so I left it out.
 
-**No per-subscriber circuit breaking.** [WRITE: One dead subscriber currently
-consumes worker capacity on every poll cycle. What you'd add.]
+**No per-subscriber circuit breaking.** A subscriber that is down still gets
+claimed and attempted on schedule, and each attempt occupies a worker slot for the
+full HTTP timeout. One dead endpoint with a large backlog can therefore consume
+most of the worker pool while delivering nothing. The fix is to track consecutive
+failures per subscriber and skip claiming for that subscriber entirely once a
+threshold is crossed, retrying a single probe delivery periodically instead.
 
 **High-churn table, no vacuum tuning.** Every claim is an `UPDATE`, and the
 baseline plan showed `dirtied=50` — `FOR UPDATE` writes lock information back to
-50 heap pages per claim. [WRITE: Dead tuples accumulate; mention autovacuum and
-`fillfactor` for HOT updates. You don't need to have tuned it — noticing it is
-the point.]
+50 heap pages per claim. Each status transition also produces a dead tuple, so a
+row that is claimed, retried and finally dead-lettered leaves several behind.
+Autovacuum handles this by default, but on a table with this update rate it is
+worth tuning the per-table thresholds so cleanup keeps pace, and lowering
+`fillfactor` so updates can stay on the same page as HOT updates rather than
+forcing index writes. I have not tuned either; the plan output is the evidence
+that it would eventually matter.
 
-**Payload retention.** [WRITE: Full payloads are stored indefinitely. What that
-means for PII and what a retention policy would look like.]
+**Payload retention.** Full webhook payloads are stored in `events` indefinitely,
+and those payloads are whatever the provider sent — for a payments provider that
+plausibly includes names, email addresses and partial card details. There is
+currently no deletion path at all. A real deployment needs a retention window
+after which delivered events have their payload column nulled while keeping the
+event ID for idempotency, so duplicates are still rejected after the data itself
+is gone.
 
 ---
 
 ## What's not here, on purpose
 
-No UI, no auth system, no admin dashboard. [WRITE: One sentence on why adding them
-would have made this a worse demonstration of the thing it's actually about.]
+No UI, no auth system, no admin dashboard. Each of those would have added surface
+area that is well understood and quick to review, and none of them would have made
+the delivery guarantees any stronger — the interesting part of this service is
+what happens when things fail, and none of that is visible in a dashboard.
 
 Dead-letter replay is the obvious next step: reset the delivery to `PENDING`,
 `attempts = 0`, delete the dead-letter row. Roughly three lines, and it turns the

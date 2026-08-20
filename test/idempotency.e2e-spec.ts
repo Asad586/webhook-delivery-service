@@ -4,6 +4,7 @@ import { createHmac } from 'node:crypto';
 import request from 'supertest';
 import { AppModule } from '../src/app.module';
 import { PrismaService } from '../src/prisma/prisma.service';
+import type { App } from 'supertest/types';
 
 const SECRET = process.env.WEBHOOK_SECRET_STRIPE!;
 
@@ -67,7 +68,7 @@ describe('idempotency under concurrency', () => {
 
     const responses = await Promise.all(
       Array.from({ length: 20 }, () =>
-        request(app.getHttpServer())
+        request(app.getHttpServer() as App)
           .post('/webhooks/stripe')
           .set('Content-Type', 'application/json')
           .set('X-Webhook-Signature', signature)
@@ -77,7 +78,9 @@ describe('idempotency under concurrency', () => {
 
     expect(responses.every((r) => r.status === 200)).toBe(true);
 
-    const accepted = responses.filter((r) => r.body.status === 'accepted');
+    const accepted = responses.filter(
+      (r) => (r.body as { status?: string }).status === 'accepted',
+    );
     expect(accepted).toHaveLength(1);
 
     expect(
