@@ -64,7 +64,9 @@ model Delivery {
   deadLetter DeadLetter?
 
   @@unique([eventId, subscriberId])
-  @@index([status, nextAttemptAt])
+    // Pending-queue index is a partial index, created by hand in
+  // migrations/20260819120000_partial_pending_index. Prisma cannot express
+  // WHERE clauses on indexes.
   @@map("deliveries")
 }
 
