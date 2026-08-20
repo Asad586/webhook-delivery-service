@@ -1,7 +1,6 @@
 import { Test } from '@nestjs/testing';
 import { INestApplication } from '@nestjs/common';
 import { createHmac } from 'node:crypto';
-import { Agent } from 'node:http';
 import request from 'supertest';
 import { AppModule } from '../src/app.module';
 import { PrismaService } from '../src/prisma/prisma.service';
@@ -29,6 +28,13 @@ describe('idempotency under concurrency', () => {
 
     app = moduleRef.createNestApplication({ rawBody: true });
     await app.init();
+
+    // app.init() alone does not bind a port, which makes supertest start and
+    // stop an ephemeral server per request. Under a concurrent burst that
+    // bind/unbind churn resets in-flight sockets (ECONNRESET on a 2-core CI
+    // runner). Listening once for the whole suite removes that entirely.
+    await app.listen(0);
+
     prisma = app.get(PrismaService);
   }, 30000);
 
@@ -67,43 +73,33 @@ describe('idempotency under concurrency', () => {
       }),
     );
     const signature = sign(raw);
-
-    // A single keep-alive agent for the burst. The property under test is
-    // concurrent ingestion, not concurrent TCP setup — on a 2-core CI runner,
-    // opening 20 fresh sockets at once was enough to produce ECONNRESET.
-    const agent = new Agent({ keepAlive: true, maxSockets: CONCURRENCY });
     const server = app.getHttpServer() as App;
 
-    try {
-      const responses = await Promise.all(
-        Array.from({ length: CONCURRENCY }, () =>
-          request(server)
-            .post('/webhooks/stripe')
-            .agent(agent)
-            .set('Content-Type', 'application/json')
-            .set('X-Webhook-Signature', signature)
-            .send(raw.toString('utf8')),
-        ),
-      );
+    const responses = await Promise.all(
+      Array.from({ length: CONCURRENCY }, () =>
+        request(server)
+          .post('/webhooks/stripe')
+          .set('Content-Type', 'application/json')
+          .set('X-Webhook-Signature', signature)
+          .send(raw.toString('utf8')),
+      ),
+    );
 
-      // No request leaks a 500. A unique-violation escaping to the caller
-      // would make the provider retry an event that was already ingested.
-      expect(responses.every((r) => r.status === 200)).toBe(true);
+    // No request leaks a 500. A unique-violation escaping to the caller would
+    // make the provider retry an event that was already ingested.
+    expect(responses.every((r) => r.status === 200)).toBe(true);
 
-      // Exactly one request performed the insert; the rest saw the duplicate.
-      const accepted = responses.filter(
-        (r) => (r.body as { status?: string }).status === 'accepted',
-      );
-      expect(accepted).toHaveLength(1);
+    // Exactly one request performed the insert; the rest saw the duplicate.
+    const accepted = responses.filter(
+      (r) => (r.body as { status?: string }).status === 'accepted',
+    );
+    expect(accepted).toHaveLength(1);
 
-      expect(
-        await prisma.event.count({ where: { providerEventId: 'evt_race' } }),
-      ).toBe(1);
+    expect(
+      await prisma.event.count({ where: { providerEventId: 'evt_race' } }),
+    ).toBe(1);
 
-      // Two subscribers, one fan-out — not CONCURRENCY × 2.
-      expect(await prisma.delivery.count()).toBe(2);
-    } finally {
-      agent.destroy();
-    }
+    // Two subscribers, one fan-out — not CONCURRENCY x 2.
+    expect(await prisma.delivery.count()).toBe(2);
   }, 30000);
 });
