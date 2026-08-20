@@ -16,7 +16,9 @@
     "test:watch": "jest --watch",
     "test:cov": "jest --coverage",
     "test": "cross-env NODE_OPTIONS=--experimental-vm-modules jest",
-    "test:e2e": "cross-env NODE_OPTIONS=--experimental-vm-modules jest --config ./test/jest-e2e.json"
+    "test:e2e": "cross-env NODE_OPTIONS=--experimental-vm-modules jest --config ./test/jest-e2e.json",
+    "seed:dev": "node scripts/seed-dev.js",
+    "seed:load": "node scripts/seed-load.js"
   },
   "dependencies": {
     "@nestjs/common": "^11.0.1",
