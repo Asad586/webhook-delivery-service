@@ -1,98 +1,412 @@
-<p align="center">
-  <a href="http://nestjs.com/" target="blank"><img src="https://nestjs.com/img/logo-small.svg" width="120" alt="Nest Logo" /></a>
-</p>
+# Webhook Delivery Service
 
-[circleci-image]: https://img.shields.io/circleci/build/github/nestjs/nest/master?token=abc123def456
-[circleci-url]: https://circleci.com/gh/nestjs/nest
+> **How to use this file:** everything in `[WRITE: ...]` is a prompt for you, not
+> content. Replace each one with your own prose and delete the marker. The tables,
+> numbers, and query plans are already filled in from your actual runs — don't
+> change those. Delete this block when you're done.
 
-  <p align="center">A progressive <a href="http://nodejs.org" target="_blank">Node.js</a> framework for building efficient and scalable server-side applications.</p>
-    <p align="center">
-<a href="https://www.npmjs.com/~nestjscore" target="_blank"><img src="https://img.shields.io/npm/v/@nestjs/core.svg" alt="NPM Version" /></a>
-<a href="https://www.npmjs.com/~nestjscore" target="_blank"><img src="https://img.shields.io/npm/l/@nestjs/core.svg" alt="Package License" /></a>
-<a href="https://www.npmjs.com/~nestjscore" target="_blank"><img src="https://img.shields.io/npm/dm/@nestjs/common.svg" alt="NPM Downloads" /></a>
-<a href="https://circleci.com/gh/nestjs/nest" target="_blank"><img src="https://img.shields.io/circleci/build/github/nestjs/nest/master" alt="CircleCI" /></a>
-<a href="https://discord.gg/G7Qnnhy" target="_blank"><img src="https://img.shields.io/badge/discord-online-brightgreen.svg" alt="Discord"/></a>
-<a href="https://opencollective.com/nest#backer" target="_blank"><img src="https://opencollective.com/nest/backers/badge.svg" alt="Backers on Open Collective" /></a>
-<a href="https://opencollective.com/nest#sponsor" target="_blank"><img src="https://opencollective.com/nest/sponsors/badge.svg" alt="Sponsors on Open Collective" /></a>
-  <a href="https://paypal.me/kamilmysliwiec" target="_blank"><img src="https://img.shields.io/badge/Donate-PayPal-ff3f59.svg" alt="Donate us"/></a>
-    <a href="https://opencollective.com/nest#sponsor"  target="_blank"><img src="https://img.shields.io/badge/Support%20us-Open%20Collective-41B883.svg" alt="Support us"></a>
-  <a href="https://twitter.com/nestframework" target="_blank"><img src="https://img.shields.io/twitter/follow/nestframework.svg?style=social&label=Follow" alt="Follow us on Twitter"></a>
-</p>
-  <!--[![Backers on Open Collective](https://opencollective.com/nest/backers/badge.svg)](https://opencollective.com/nest#backer)
-  [![Sponsors on Open Collective](https://opencollective.com/nest/sponsors/badge.svg)](https://opencollective.com/nest#sponsor)-->
+A service that ingests webhooks from a provider exactly once and delivers them
+onward to registered subscribers with retries, exponential backoff, and a
+dead-letter queue.
 
-## Description
+NestJS · PostgreSQL 16 · Prisma 7 · Docker Compose · Jest · GitHub Actions
 
-[Nest](https://github.com/nestjs/nest) framework TypeScript starter repository.
+---
 
-## Project setup
+## The problem
 
-```bash
-$ npm install
+[WRITE: Three or four sentences. Providers deliver at-least-once, so duplicates
+are normal, not exceptional. Networks fail mid-response. Subscribers go down for
+hours and come back all at once. State what sits in the middle and what it has to
+guarantee. Don't sell — describe.]
+
+---
+
+## Guarantees
+
+**Exactly-once ingestion.** A provider that delivers the same event ID fifty times
+produces exactly one `events` row and exactly one fan-out. Enforced by a unique
+constraint on `(source, provider_event_id)` and a single-statement
+`INSERT ... ON CONFLICT DO NOTHING`, not by application-level checking.
+
+**At-least-once delivery.** Every delivery is attempted until it succeeds or
+exhausts its attempt budget. Subscribers may receive the same event more than
+once and must deduplicate on `X-Webhook-Event-Id`.
+
+**Bounded retry.** Six attempts with full-jitter exponential backoff from 1s to a
+1h cap, after which the delivery moves to `dead_letters` and leaves the queue
+permanently.
+
+**Authenticated ingestion.** HMAC-SHA256 over the raw request bytes with a
+timestamp inside the signed payload, compared in constant time.
+
+---
+
+## What is NOT guaranteed
+
+### Ordering
+
+[WRITE: Say plainly that ordering is not preserved, then explain why in terms of
+the design — concurrent workers claim disjoint batches, each delivery carries
+independent retry state, so a delivery that fails once will land after one that
+never failed. Then the important half: what guaranteeing order would cost.
+Per-subscriber serialisation means one slow subscriber blocks every event behind
+it. Say why you'd rather have the current behaviour.]
+
+### Exactly-once delivery
+
+[WRITE: This is impossible over HTTP to a third party and you should say so
+directly. Describe the specific case: subscriber returns 200, connection dies
+before the response is read, you retry, they get it twice. There is no protocol
+fix. Then say what you did instead — X-Webhook-Event-Id, so deduplication is
+possible on their side — and be explicit that this moves the problem rather than
+solving it.]
+
+### Delivery within a bounded time
+
+[WRITE: Backoff is exponential to a 1h cap, so a subscriber down for a day gets
+deliveries spread across the retry window and then dead-lettered. State the actual
+worst case from your config.]
+
+---
+
+## Architecture
+
+```
+POST /webhooks/:source
+  │
+  ├─ SignatureGuard ──── HMAC over raw bytes, ±300s timestamp window
+  │
+  ├─ INSERT ... ON CONFLICT DO NOTHING ─── duplicate? return 200, stop
+  │
+  └─ fan out to matching subscribers      ← same transaction as the insert
+                │
+                ▼
+        deliveries (PENDING)
+                │
+     ┌──────────┴──────────┐
+     │  worker poll loop   │  UPDATE ... FROM (SELECT ... FOR UPDATE SKIP LOCKED)
+     └──────────┬──────────┘
+                │ claim commits immediately; IN_FLIGHT + locked_at is a lease
+                ▼
+          POST to subscriber
+                │
+     ┌──────────┼──────────┬────────────────┐
+     ▼          ▼          ▼                ▼
+  SUCCEEDED  PENDING    FAILED         (worker dies)
+             + backoff  + dead_letter        │
+                                        reaper requeues
+                                        after lease expiry
 ```
 
-## Compile and run the project
+---
 
-```bash
-# development
-$ npm run start
+## Idempotency
 
-# watch mode
-$ npm run start:dev
+Two implementations are in the repository. The incorrect one is kept
+deliberately: `src/webhooks/webhooks.service.naive.ts`.
 
-# production mode
-$ npm run start:prod
+### The version that looks correct
+
+```ts
+const existing = await this.prisma.event.findFirst({
+  where: { source, providerEventId: payload.id },
+});
+if (existing) return { status: 'duplicate' };
+
+const event = await this.prisma.event.create({ ... });
 ```
 
-## Run tests
+[WRITE: Explain the race window in your own words — between the SELECT and the
+INSERT another request can commit the same event, so the SELECT proves nothing
+about the state at INSERT time. Note that this passes every single-threaded test.]
 
-```bash
-# unit tests
-$ npm run test
+### Measured failure
 
-# e2e tests
-$ npm run test:e2e
+20 concurrent POSTs with an identical event ID, against the naive handler:
 
-# test coverage
-$ npm run test:cov
+```
+expect(responses.every((r) => r.status === 200)).toBe(true)
+
+8 of 20 requests returned 500.
+23505: duplicate key value violates unique constraint "events_source_provider_event_id_key"
 ```
 
-## Deployment
+**8 of 20, not 19 of 20.** Twelve requests arrived after the winner had committed
+and correctly returned `duplicate`. The window is real but narrow — which is
+exactly why this survives code review and single-threaded tests, and only appears
+in production under load.
 
-When you're ready to deploy your NestJS application to production, there are some key steps you can take to ensure it runs as efficiently as possible. Check out the [deployment documentation](https://docs.nestjs.com/deployment) for more information.
+[WRITE: One paragraph on why the 500s matter more than they look. The unique
+constraint protected the data — no duplicate events were stored. The damage is at
+the API boundary: the provider sees failures for an event that was ingested, and
+retries, reopening the window. Say what that does to the error rate.]
 
-If you are looking for a cloud-based platform to deploy your NestJS application, check out [Mau](https://mau.nestjs.com), our official platform for deploying NestJS applications on AWS. Mau makes deployment straightforward and fast, requiring just a few simple steps:
+Full writeup: [`docs/naive-failure.md`](docs/naive-failure.md)
 
-```bash
-$ npm install -g @nestjs/mau
-$ mau deploy
+### The version that ships
+
+```ts
+INSERT INTO events (...)
+VALUES (...)
+ON CONFLICT (source, provider_event_id) DO NOTHING
+RETURNING id
 ```
 
-With Mau, you can deploy your application in just a few clicks, allowing you to focus on building features rather than managing infrastructure.
+[WRITE: Why the empty result set is the duplicate signal, why this is one round
+trip, and why letting the database arbitrate beats coordinating in application
+code.]
 
-## Resources
+### The subtler bug: fan-out must be in the same transaction
 
-Check out a few resources that may come in handy when working with NestJS:
+[WRITE: This is the most important paragraph in the README. Walk the failure:
+insert the event, commit, then create deliveries, then crash. The retry sees a
+duplicate, returns 200, and that event is durably stored and permanently
+undelivered. Silent loss that only appears under crash conditions. Say what
+`$transaction` buys and what it costs — the transaction now scales with subscriber
+count, and name the point at which you'd move fan-out to an outbox worker instead.]
 
-- Visit the [NestJS Documentation](https://docs.nestjs.com) to learn more about the framework.
-- For questions and support, please visit our [Discord channel](https://discord.gg/G7Qnnhy).
-- To dive deeper and get more hands-on experience, check out our official video [courses](https://courses.nestjs.com/).
-- Deploy your application to AWS with the help of [NestJS Mau](https://mau.nestjs.com) in just a few clicks.
-- Visualize your application graph and interact with the NestJS application in real-time using [NestJS Devtools](https://devtools.nestjs.com).
-- Need help with your project (part-time to full-time)? Check out our official [enterprise support](https://enterprise.nestjs.com).
-- To stay in the loop and get updates, follow us on [X](https://x.com/nestframework) and [LinkedIn](https://linkedin.com/company/nestjs).
-- Looking for a job, or have a job to offer? Check out our official [Jobs board](https://jobs.nestjs.com).
+---
 
-## Support
+## Concurrency: `SELECT ... FOR UPDATE SKIP LOCKED`
 
-Nest is an MIT-licensed open source project. It can grow thanks to the sponsors and support by the amazing backers. If you'd like to join them, please [read more here](https://docs.nestjs.com/support).
+```sql
+UPDATE deliveries d
+SET status = 'IN_FLIGHT', attempts = d.attempts + 1, locked_at = now()
+FROM (
+  SELECT id FROM deliveries
+  WHERE status = 'PENDING' AND next_attempt_at <= now()
+  ORDER BY next_attempt_at
+  LIMIT $1
+  FOR UPDATE SKIP LOCKED
+) AS claimed
+WHERE d.id = claimed.id
+RETURNING ...
+```
 
-## Stay in touch
+Verified by `test/claim.e2e-spec.ts`: five concurrent workers claiming batches of
+30 from 100 pending rows produce 100 distinct IDs, no row claimed twice, maximum
+`attempts` of 1, completing well inside the timeout.
 
-- Author - [Kamil Myśliwiec](https://twitter.com/kammysliwiec)
-- Website - [https://nestjs.com](https://nestjs.com/)
-- Twitter - [@nestframework](https://twitter.com/nestframework)
+Three design decisions:
 
-## License
+**The claim transaction commits before any HTTP call.** [WRITE: Why holding a row
+lock across a request to a third party defeats the purpose — a subscriber taking
+30s would hold a Postgres transaction open for 30s. `IN_FLIGHT` + `locked_at` is a
+lease held in committed data, not a lock held in a transaction.]
 
-Nest is [MIT licensed](https://github.com/nestjs/nest/blob/master/LICENSE).
+**`attempts` increments at claim time, not on failure.** [WRITE: What a SIGKILL
+mid-flight would otherwise do — the attempt wouldn't count, and a crash loop
+retries forever without ever dead-lettering.]
+
+**A reaper requeues expired leases.** [WRITE: Leases need something to reclaim
+them when a worker dies. State your lease window and why it must exceed the HTTP
+timeout with margin — too short and the reaper requeues live work, deliberately
+double-delivering.]
+
+---
+
+## Retry policy
+
+| Response                   | Treatment                                   |
+| -------------------------- | ------------------------------------------- |
+| 2xx                        | Success                                     |
+| 429                        | Retry, honouring `Retry-After` when present |
+| 408, 5xx                   | Retry with backoff                          |
+| Other 4xx                  | Dead-letter — the payload will not improve  |
+| Timeout / connection error | Retry with backoff                          |
+
+```ts
+const exponential = Math.min(capMs, baseMs * 2 ** (attempts - 1));
+return Math.floor(random() * exponential); // full jitter
+```
+
+[WRITE: Why full jitter rather than `exponential + small random`. The thundering
+herd case: a subscriber recovers from an outage and every queued delivery fires in
+the same millisecond, knocking it over again. Then note that Stripe retries all
+non-2xx while you distinguish permanent from transient, and say which you think is
+right and why.]
+
+---
+
+## Query performance
+
+500,000 deliveries: 490,000 `SUCCEEDED`, 5,000 `FAILED`, 5,000 `PENDING`, of which
+3,334 are due. PostgreSQL 16.14 in Docker. Each plan run three times; the warm run
+is reported.
+
+Query under test:
+
+```sql
+EXPLAIN (ANALYZE, BUFFERS)
+SELECT id FROM deliveries
+WHERE status = 'PENDING' AND next_attempt_at <= now()
+ORDER BY next_attempt_at
+LIMIT 50
+FOR UPDATE SKIP LOCKED;
+```
+
+| Index                                        | Execution | Buffers | Index size |
+| -------------------------------------------- | --------- | ------- | ---------- |
+| None                                         | 35.529 ms | 7,246   | —          |
+| `(status, next_attempt_at)`                  | 0.217 ms  | 153     | 5,104 kB   |
+| `(next_attempt_at) WHERE status = 'PENDING'` | 0.241 ms  | 152     | **64 kB**  |
+
+### No index
+
+```
+Limit  (cost=15984.88..15985.51 rows=50) (actual time=35.269..35.440 rows=50)
+  Buffers: shared hit=3546 read=3700 dirtied=50
+  ->  Sort  (actual time=35.225..35.232 rows=50)
+        Sort Method: quicksort  Memory: 279kB
+        ->  Seq Scan on deliveries  (actual time=0.023..34.402 rows=3334)
+              Filter: ((status = 'PENDING') AND (next_attempt_at <= now()))
+              Rows Removed by Filter: 496666
+Execution Time: 35.529 ms
+```
+
+Reads the entire table, discards 99.3% of it, then materialises and sorts all
+3,334 matches to return 50.
+
+### Partial index
+
+```
+Limit  (cost=0.29..165.09 rows=50) (actual time=0.053..0.205 rows=50)
+  Buffers: shared hit=150 read=2
+  ->  Index Scan using deliveries_pending_idx on deliveries
+        Index Cond: (next_attempt_at <= now())
+        Filter: (status = 'PENDING')
+Execution Time: 0.241 ms
+```
+
+### Conclusion
+
+[WRITE: Be honest here, it's the section that earns the most credit. The index is
+worth 164×. The choice _between_ the two indexes is worth nothing on read latency —
+0.217 vs 0.241 ms is noise, and the partial is marginally slower. The win is size:
+64 kB vs 5,104 kB, 80×, because the index holds only the ~1% of rows actually
+queued. Rows leave it automatically on transition to SUCCEEDED or FAILED, so it
+stays flat as delivery volume grows while the compound index tracks total table
+size forever. Say you chose it for write cost and cache residency, not read
+latency.]
+
+Two honest caveats:
+
+- The partial index carries a `Filter: (status = 'PENDING')` line that the
+  compound index resolves in the `Index Cond`. Status isn't a column in the
+  partial index, only in its predicate, so Postgres re-checks it per heap row.
+- The planner's estimated cost is _higher_ for the partial index (10,466 vs
+  4,943). It is wrong at this scale, but the predicate must be provable — a
+  literal `status = 'PENDING'` works, a parameterised status does not. The claim
+  query hardcodes the literal for this reason.
+
+Prisma cannot express partial indexes; the index is created by hand in
+`prisma/migrations/20260819120000_partial_pending_index/migration.sql`.
+
+---
+
+## Failure modes
+
+| Failure                                  | Behaviour                                      | Recovery                                  |
+| ---------------------------------------- | ---------------------------------------------- | ----------------------------------------- |
+| Crash after event insert, before fan-out | Impossible — same transaction                  | n/a                                       |
+| Worker killed mid-delivery               | Row stuck `IN_FLIGHT`, attempt already counted | Reaper requeues after lease expiry        |
+| Subscriber returns 5xx                   | Classified retryable, backoff                  | Retried up to 6 times, then dead-lettered |
+| Subscriber unreachable                   | Connection error, no status code recorded      | Same path as 5xx                          |
+| Subscriber returns 4xx                   | Classified permanent                           | Dead-lettered immediately                 |
+| Duplicate provider delivery              | `ON CONFLICT DO NOTHING`                       | 200, no reprocessing                      |
+| Replayed request with captured signature | Rejected outside ±300s window                  | n/a                                       |
+| Clock skew beyond 300s                   | Valid requests rejected                        | [WRITE: what you'd do]                    |
+
+Observed in testing — three distinct failure signatures across one dead-lettered
+event: `503` (subscriber rejecting), `500` (subscriber erroring), and `NULL`
+(nothing listening, no response at all). All three exhausted 6 attempts and moved
+to `dead_letters` correctly.
+
+---
+
+## Running it
+
+```bash
+docker compose up -d
+npx prisma migrate deploy
+npm run seed:dev
+
+# stub subscribers, one terminal each
+node scripts/stub-subscriber.js 4001 ok
+node scripts/stub-subscriber.js 4002 flaky    # fails 3x then succeeds
+node scripts/stub-subscriber.js 4003 fail     # always 500
+
+npm run start:dev
+```
+
+Send a signed webhook:
+
+```bash
+node -e "require('fs').writeFileSync('payload.json', JSON.stringify({id:'evt_1',type:'payment.succeeded',data:{amount:4200}}))"
+node scripts/sign.js          # prints a curl command with a valid signature
+```
+
+Load test data and query plans:
+
+```bash
+npm run seed:load             # 500k deliveries, ~40s
+```
+
+### Tests
+
+```bash
+npm run test:e2e
+```
+
+Requires the `db_test` service on port 5435. Tests run against real PostgreSQL,
+not a mock — every behaviour worth testing here is a database behaviour, and a
+mocked client will happily confirm a race condition doesn't exist.
+
+Node prints an `ExperimentalWarning: VM Modules` on every test run. Prisma 7 loads
+its query compiler via dynamic import, which Jest's CJS sandbox requires
+`--experimental-vm-modules` to permit. Expected, not a fault.
+
+`.env.test` is committed deliberately — it contains no real secrets, only local
+container credentials, and CI needs it.
+
+---
+
+## Tradeoffs, and what would change at scale
+
+[WRITE: This section is read first by senior engineers. Cover at minimum:]
+
+**Postgres as a queue.** [WRITE: Why it's the right call here — one fewer moving
+part, transactional fan-out is free, `SKIP LOCKED` genuinely solves the contention
+problem. Then the honest half: name the specific point at which you'd move to a
+real broker, and what signal would tell you you'd reached it.]
+
+**Fan-out inside the ingest transaction.** [WRITE: Fine at hundreds of subscribers.
+What breaks first, and what the outbox alternative would look like.]
+
+**Polling rather than `LISTEN`/`NOTIFY`.** [WRITE: 1s poll latency is well inside
+requirements. Say you considered NOTIFY and why you didn't build it — naming an
+optimisation you declined reads better than building it.]
+
+**No per-subscriber circuit breaking.** [WRITE: One dead subscriber currently
+consumes worker capacity on every poll cycle. What you'd add.]
+
+**High-churn table, no vacuum tuning.** Every claim is an `UPDATE`, and the
+baseline plan showed `dirtied=50` — `FOR UPDATE` writes lock information back to
+50 heap pages per claim. [WRITE: Dead tuples accumulate; mention autovacuum and
+`fillfactor` for HOT updates. You don't need to have tuned it — noticing it is
+the point.]
+
+**Payload retention.** [WRITE: Full payloads are stored indefinitely. What that
+means for PII and what a retention policy would look like.]
+
+---
+
+## What's not here, on purpose
+
+No UI, no auth system, no admin dashboard. [WRITE: One sentence on why adding them
+would have made this a worse demonstration of the thing it's actually about.]
+
+Dead-letter replay is the obvious next step: reset the delivery to `PENDING`,
+`attempts = 0`, delete the dead-letter row. Roughly three lines, and it turns the
+DLQ from a graveyard into an operational tool.
