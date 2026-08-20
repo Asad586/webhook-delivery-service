@@ -1,5 +1,7 @@
 # Webhook Delivery Service
 
+[![CI](https://github.com/Asad586/webhook-delivery-service/actions/workflows/ci.yml/badge.svg)](https://github.com/Asad586/webhook-delivery-service/actions/workflows/ci.yml)
+
 A service that ingests webhooks from a provider exactly once and delivers them
 onward to registered subscribers with retries, exponential backoff, and a
 dead-letter queue.
@@ -98,9 +100,8 @@ POST /webhooks/:source
   │
   ├─ SignatureGuard ──── HMAC over raw bytes, ±300s timestamp window
   │
-  ├─ INSERT ... ON CONFLICT DO NOTHING ─── duplicate? return 200, stop
-  │
-  └─ fan out to matching subscribers      ← same transaction as the insert
+  └─ one statement: INSERT ... ON CONFLICT DO NOTHING
+                    + fan-out to matching subscribers via CTE
                 │
                 ▼
         deliveries (PENDING)
@@ -175,11 +176,21 @@ Full writeup: [`docs/naive-failure.md`](docs/naive-failure.md)
 
 ### The version that ships
 
-```ts
-INSERT INTO events (...)
-VALUES (...)
-ON CONFLICT (source, provider_event_id) DO NOTHING
-RETURNING id
+```sql
+WITH new_event AS (
+  INSERT INTO events (...)
+  VALUES (...)
+  ON CONFLICT (source, provider_event_id) DO NOTHING
+  RETURNING id
+),
+fanout AS (
+  INSERT INTO deliveries (...)
+  SELECT ... FROM new_event ne
+  CROSS JOIN subscribers s
+  WHERE s.active = true AND $type = ANY(s.event_types)
+  RETURNING id
+)
+SELECT ne.id, (SELECT count(*) FROM fanout) FROM new_event ne
 ```
 
 There is no separate check. The insert either produces a row or it does not, and
@@ -195,16 +206,27 @@ The wider point is that the database is the only component that can arbitrate
 here. Two application processes cannot agree on who inserted first without asking
 the database anyway, so the check belongs in the same statement as the write.
 
-### The subtler bug: fan-out must be in the same transaction
+### The subtler bug: fan-out must be atomic with the insert
 
 If the event insert and the delivery inserts commit separately, a crash between
 them leaves the event stored with nothing to deliver. The provider retries, the
 handler sees the event already exists and returns 200, so the provider stops.
 Nothing errors and nothing alerts — the worker only reads `deliveries`, and there
-is no row there to read. Running both writes in one transaction makes the pair
-atomic, at the cost of holding a transaction open across the subscriber query and
-the delivery inserts. That's fine at hundreds of subscribers; past that I'd
-insert the event alone and let a separate fan-out worker create the deliveries.
+is no row there to read.
+
+Both writes are therefore in a single statement, using data-modifying CTEs. A
+single statement is atomic in PostgreSQL, and data-modifying CTEs are guaranteed
+to execute exactly once and to completion, so the guarantee is the same as a
+transaction would give.
+
+The first version did use an interactive `$transaction`, and CI is what showed
+the problem with it. An interactive transaction holds a pooled connection across
+several round trips, so ingest concurrency is capped by the pool size. Running 20
+concurrent duplicates on a 2-core GitHub Actions runner, transactions expired
+waiting for connections before their first query ran — a limit that a 12-core
+development machine hid completely. The single-statement version holds one
+connection for one round trip and the failure disappeared, along with most of the
+latency.
 
 ---
 
@@ -385,7 +407,7 @@ Prisma cannot express partial indexes; the index is created by hand in
 
 | Failure                                  | Behaviour                                      | Recovery                                  |
 | ---------------------------------------- | ---------------------------------------------- | ----------------------------------------- |
-| Crash after event insert, before fan-out | Impossible — same transaction                  | n/a                                       |
+| Crash after event insert, before fan-out | Impossible — one atomic statement              | n/a                                       |
 | Worker killed mid-delivery               | Row stuck `IN_FLIGHT`, attempt already counted | Reaper requeues after lease expiry        |
 | Subscriber returns 5xx                   | Classified retryable, backoff                  | Retried up to 6 times, then dead-lettered |
 | Subscriber unreachable                   | Connection error, no status code recorded      | Same path as 5xx                          |
@@ -409,7 +431,10 @@ to `dead_letters` correctly.
 ## Running it
 
 ```bash
+cp .env.example .env          # Windows: copy .env.example .env
 docker compose up -d
+npm ci
+npx prisma generate
 npx prisma migrate deploy
 npm run seed:dev
 
@@ -434,6 +459,9 @@ Load test data and query plans:
 npm run seed:load             # 500k deliveries, ~40s
 ```
 
+Stop the dev server before seeding load data — a running worker will claim rows
+mid-seed and skew the status distribution the query plans depend on.
+
 ### Tests
 
 ```bash
@@ -444,12 +472,17 @@ Requires the `db_test` service on port 5435. Tests run against real PostgreSQL,
 not a mock — every behaviour worth testing here is a database behaviour, and a
 mocked client will happily confirm a race condition doesn't exist.
 
+CI runs the same suite on a 2-core runner, which is deliberately smaller than a
+development machine. That difference has already earned its keep: it surfaced the
+connection-pool bound on interactive transactions described above, which local
+runs never hit.
+
 Node prints an `ExperimentalWarning: VM Modules` on every test run. Prisma 7 loads
 its query compiler via dynamic import, which Jest's CJS sandbox requires
 `--experimental-vm-modules` to permit. Expected, not a fault.
 
 `.env.test` is committed deliberately — it contains no real secrets, only local
-container credentials, and CI needs it.
+container credentials, and CI needs it. `.env` is not; copy `.env.example`.
 
 ---
 
@@ -457,9 +490,9 @@ container credentials, and CI needs it.
 
 **Postgres as a queue.** For this workload it is the right call. There is one
 datastore instead of two, so there is no window in which an event is committed to
-the database but not yet published to a broker — the fan-out is transactional for
-free, which is the guarantee the whole design rests on. `SKIP LOCKED` handles
-worker contention properly, as the concurrency test shows.
+the database but not yet published to a broker — the fan-out is atomic for free,
+which is the guarantee the whole design rests on. `SKIP LOCKED` handles worker
+contention properly, as the concurrency test shows.
 
 Where it stops being right is throughput on the claim query. Every worker polls
 the same index and every claim is an `UPDATE`, so contention and write
@@ -469,14 +502,14 @@ where workers are competing rather than working, and adding more makes it worse.
 broker with real consumer groups would be the answer then, at the cost of having
 to reintroduce the outbox pattern to keep fan-out atomic.
 
-**Fan-out inside the ingest transaction.** The transaction stays open for the
-subscriber query and one insert per matching subscriber, so its duration scales
-with subscriber count on the hottest write path in the service. What breaks first
-is receive latency, and it degrades gradually rather than failing outright. The
-alternative is to insert only the event and have a separate worker create the
-delivery rows by scanning for events without them — the event row becomes the
-outbox record. That keeps the atomicity guarantee while making the request path
-constant-time, and it is the change I would make first if subscriber counts grew.
+**Fan-out inside the ingest statement.** The fan-out CTE inserts one row per
+matching subscriber, so the statement's cost scales with subscriber count on the
+hottest write path in the service. What breaks first is receive latency, and it
+degrades gradually rather than failing outright. The alternative is to insert only
+the event and have a separate worker create the delivery rows by scanning for
+events without them — the event row becomes the outbox record. That keeps the
+atomicity guarantee while making the request path constant-time, and it is the
+change I would make first if subscriber counts grew.
 
 **Polling rather than `LISTEN`/`NOTIFY`.** Polling every second means up to a
 second of added latency on a delivery that could have started immediately.
