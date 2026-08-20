@@ -35,8 +35,9 @@ constraint on `(source, provider_event_id)` and a single-statement
 exhausts its attempt budget. Subscribers may receive the same event more than
 once and must deduplicate on `X-Webhook-Event-Id`.
 
-**Bounded retry.** Six attempts with full-jitter exponential backoff, after which
-the delivery moves to `dead_letters` and leaves the queue permanently.
+**Bounded retry.** Ten attempts with full-jitter exponential backoff over roughly
+three hours, after which the delivery moves to `dead_letters` and leaves the queue
+permanently.
 
 **Authenticated ingestion.** HMAC-SHA256 over the raw request bytes with a
 timestamp inside the signed payload, compared in constant time.
@@ -78,18 +79,21 @@ party that can actually observe whether they have already processed it.
 
 ### Delivery within a bounded time
 
-Retries are scheduled with full jitter against an exponential ceiling, so the
-delay between attempts is random rather than fixed. With the current
-configuration — base 1s, six attempts — the ceilings across the five retries are
-1s, 2s, 4s, 8s and 16s, giving a worst case of roughly 31 seconds before an event
-dead-letters, and an expected time of about half that.
+Retries use full jitter against an exponential ceiling, so each delay is random
+rather than fixed. With the shipped defaults — base 30s, ten attempts, 1h cap —
+the ceilings are 30s, 1m, 2m, 4m, 8m, 16m, 32m, then 1h twice once the cap
+engages on the eighth attempt. Worst case is roughly three hours before an event
+dead-letters; expected time is about half that, because full jitter draws
+uniformly below each ceiling.
 
-Worth noting honestly: the 1h cap in the configuration is never reached at these
-settings, because six attempts from a 1s base never climb that high. The cap only
-becomes meaningful with a larger base or a higher attempt budget. A subscriber
-down for an hour currently loses everything sent during that hour to the
-dead-letter queue, which is the correct behaviour only if dead letters are
-actually monitored and replayed.
+That window is chosen so a subscriber can be down for an hour and still receive
+everything queued during the outage. Beyond three hours the event is
+dead-lettered rather than retried indefinitely, on the basis that a subscriber
+down that long needs an operator rather than more traffic.
+
+`.env.test` uses a 100ms base and three attempts so the suite asserts scheduling
+behaviour without waiting on real durations. To reproduce the dead-letter path by
+hand, set `WORKER_MAX_ATTEMPTS=3 RETRY_BASE_MS=100` in `.env` and restart.
 
 ---
 
@@ -309,7 +313,7 @@ On classification, Stripe retries every non-2xx response. This service treats
 most 4xx as permanent and dead-letters immediately. The argument for retrying
 everything is that a 4xx can be transient — a subscriber misconfigured for a few
 minutes returns 404 and then recovers. The argument for distinguishing is that
-retrying a 400 six times over half a minute cannot succeed, because the payload
+retrying a 400 ten times over three hours cannot succeed, because the payload
 being rejected is identical on every attempt, and all it does is spend worker
 capacity and delay the dead-letter signal that tells an operator something is
 wrong. I chose to distinguish, and the cost of being wrong is bounded: a
@@ -405,16 +409,16 @@ Prisma cannot express partial indexes; the index is created by hand in
 
 ## Failure modes
 
-| Failure                                  | Behaviour                                      | Recovery                                  |
-| ---------------------------------------- | ---------------------------------------------- | ----------------------------------------- |
-| Crash after event insert, before fan-out | Impossible — one atomic statement              | n/a                                       |
-| Worker killed mid-delivery               | Row stuck `IN_FLIGHT`, attempt already counted | Reaper requeues after lease expiry        |
-| Subscriber returns 5xx                   | Classified retryable, backoff                  | Retried up to 6 times, then dead-lettered |
-| Subscriber unreachable                   | Connection error, no status code recorded      | Same path as 5xx                          |
-| Subscriber returns 4xx                   | Classified permanent                           | Dead-lettered immediately                 |
-| Duplicate provider delivery              | `ON CONFLICT DO NOTHING`                       | 200, no reprocessing                      |
-| Replayed request with captured signature | Rejected outside ±300s window                  | n/a                                       |
-| Clock skew beyond 300s                   | Valid requests rejected                        | Widen window, or use NTP on both ends     |
+| Failure                                  | Behaviour                                      | Recovery                                   |
+| ---------------------------------------- | ---------------------------------------------- | ------------------------------------------ |
+| Crash after event insert, before fan-out | Impossible — one atomic statement              | n/a                                        |
+| Worker killed mid-delivery               | Row stuck `IN_FLIGHT`, attempt already counted | Reaper requeues after lease expiry         |
+| Subscriber returns 5xx                   | Classified retryable, backoff                  | Retried up to 10 times, then dead-lettered |
+| Subscriber unreachable                   | Connection error, no status code recorded      | Same path as 5xx                           |
+| Subscriber returns 4xx                   | Classified permanent                           | Dead-lettered immediately                  |
+| Duplicate provider delivery              | `ON CONFLICT DO NOTHING`                       | 200, no reprocessing                       |
+| Replayed request with captured signature | Rejected outside ±300s window                  | n/a                                        |
+| Clock skew beyond 300s                   | Valid requests rejected                        | Widen window, or use NTP on both ends      |
 
 The clock skew row is a genuine weakness. The ±300s tolerance protects against
 replay, but it means a server whose clock has drifted rejects legitimate traffic
@@ -423,8 +427,8 @@ error message distinguishes the two cases for exactly this reason.
 
 Observed in testing — three distinct failure signatures across one dead-lettered
 event: `503` (subscriber rejecting), `500` (subscriber erroring), and `NULL`
-(nothing listening, no response at all). All three exhausted 6 attempts and moved
-to `dead_letters` correctly.
+(nothing listening, no response at all). All three exhausted their attempt budget
+and moved to `dead_letters` correctly.
 
 ---
 
@@ -555,3 +559,9 @@ what happens when things fail, and none of that is visible in a dashboard.
 Dead-letter replay is the obvious next step: reset the delivery to `PENDING`,
 `attempts = 0`, delete the dead-letter row. Roughly three lines, and it turns the
 DLQ from a graveyard into an operational tool.
+
+---
+
+## Licence
+
+MIT
